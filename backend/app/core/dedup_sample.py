@@ -9,6 +9,11 @@ import hashlib
 from datetime import datetime, timedelta
 
 from app.core.models import DedupFilter, EventRecord, SampleConfig
+from app.core.sample_verdict import (
+    SampleVerdict, SampleVerdictBatch, SampleVerdictItem,
+    classify_sample_ratio, judge_sample_records,
+    merge_event_groups, ordered_group_representatives,
+)
 
 
 # ---------- 预置去重过滤规则 ----------
@@ -122,41 +127,54 @@ class DedupSamplePipeline:
                config: SampleConfig) -> list[EventRecord]:
         """按采样配置进行采样归并。
 
-        采样：按 sample_ratio 取前 N 条。
-        归并：按 merge_key 分组，每组仅保留最新事件记录。
+        先归并：按 merge_key 分组，组内取实际最新代表；
+        后名额：按归并后的独立组数 × sample_ratio 计算名额（可为 0，
+        不强行至少一条），从每个入选组取代表。
+        明确零额度与非法比例都不产出样本（非法比例在 judge 里单独分流）。
         """
-        # 采样
-        threshold = max(1, int(len(records) * config.sample_ratio))
-        sampled = list(records[:threshold])
+        if classify_sample_ratio(config.sample_ratio) is not None:
+            return []
+        groups = merge_event_groups(records, config.merge_key)
+        ordered = ordered_group_representatives(groups)
+        quota = int(len(ordered) * float(config.sample_ratio))
+        return [rep for _, rep in ordered[:quota]]
 
-        # 归并
-        if config.merge_key:
-            merged: dict[str, EventRecord] = {}
-            for record in sampled:
-                mkey = record.parsed_fields.get(config.merge_key, "")
-                if not mkey:
-                    continue
-                existing = merged.get(mkey)
-                if existing is None or record.event_time > existing.event_time:
-                    merged[mkey] = record
-            return list(merged.values())
-        return sampled
+    def judge(self, records: list[EventRecord],
+              config: SampleConfig) -> list[SampleVerdictItem]:
+        """对同一计划下的源事件做额度判定（无副作用）。"""
+        return judge_sample_records(records, config)
 
-    def sample_all(self, records: list[EventRecord]) -> list[EventRecord]:
-        """按事件类型匹配采样配置批量采样归并。"""
-        result: list[EventRecord] = []
+    def sample_all_batch(self, records: list[EventRecord],
+                         investigation_id: str = "INV-STANDALONE") -> SampleVerdictBatch:
+        """按事件类型匹配采样配置，产出样本额度判定批次。
+
+        未配置、明确零额度和非法比例对应的源事件在批次里分开；
+        未配置类型保持原来的缺省行为（原样通过）。
+        """
+        batch = SampleVerdictBatch(investigation_id=investigation_id)
         handled_type_ids: set[str] = set()
         for config in self.sample_configs:
             target_type_id = config.event_type_id
             target_records = [r for r in records if r.event_type.type_id == target_type_id]
             handled_type_ids.add(target_type_id)
-            sampled = self.sample(target_records, config)
-            result.extend(sampled)
-        # 未匹配采样配置的事件保留原样
+            batch.items.extend(self.judge(target_records, config))
+        # 未匹配采样配置的事件保留原样，走缺省入口
         for record in records:
             if record.event_type.type_id not in handled_type_ids:
-                result.append(record)
-        return result
+                batch.items.append(SampleVerdictItem(
+                    record=record,
+                    verdict=SampleVerdict.UNCONFIGURED,
+                    reason="未配置采样计划，沿原有缺省入口通过",
+                ))
+        return batch
+
+    def sample_all(self, records: list[EventRecord]) -> list[EventRecord]:
+        """按事件类型匹配采样配置批量采样归并（兼容入口）。
+
+        与 store_events 串联：sample_all 的输出即判定批次的
+        归并许可代表 + 未配置缺省通过记录。
+        """
+        return self.sample_all_batch(records).output_events()
 
     def get_stats(self) -> dict[str, dict[str, int]]:
         """获取去重规则统计数据。"""

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,6 +16,10 @@ from app.core.models import (
     BatchCheckpoint, EventRecord, EventTypeDef, IngestJob, IngestMetric,
     LogEntry, LogFormat, LogSourceConfig, ParseResultStatus, ParseRule,
     QualityReport,
+)
+from app.core.sample_verdict import (
+    InvestigationSample, SampleVerdictBatch,
+    classify_sample_ratio, merge_event_groups, ordered_group_representatives,
 )
 
 # ---------- 预置日志来源配置 ----------
@@ -135,6 +140,10 @@ class IngestPipeline:
         self._checkpoint_store: dict[str, BatchCheckpoint] = {}
         self._event_store: dict[str, list[EventRecord]] = {}
         self._fingerprint_seen: set[str] = set()
+        # 调查样本库存：样本额度判定批次里经归并许可的代表在此落地
+        self._investigation_samples: dict[str, InvestigationSample] = {}
+        self._sample_identity: dict[tuple[str, str, str, str], str] = {}
+        self._sample_lock = threading.Lock()
 
     # ---------- 数据流 1: log_source → parser_rule → ingest_job → event_store ----------
 
@@ -211,11 +220,68 @@ class IngestPipeline:
             records.append(record)
         return records
 
-    def store_events(self, records: list[EventRecord]) -> int:
-        """写入 event_store 并返回存储条数。"""
+    def store_events(self, records: list[EventRecord] | SampleVerdictBatch) -> int:
+        """写入 event_store 并返回存储条数。
+
+        与 sample_all 串联的入口：接受普通事件记录列表，或样本额度判定批次。
+        批次数路径下，归并许可的代表存成调查样本，未配置类型保持缺省行为。
+        """
+        if isinstance(records, SampleVerdictBatch):
+            return self._store_verdict_batch(records)
         for record in records:
             self._event_store.setdefault(record.source_host, []).append(record)
         return len(records)
+
+    def _store_verdict_batch(self, batch: SampleVerdictBatch) -> int:
+        """接收样本额度判定批次：代表入调查样本库，未配置走缺省入口。"""
+        stored = 0
+        for item in batch.granted_items():
+            sample = InvestigationSample(
+                sample_id=InvestigationSample.build_id(
+                    batch.investigation_id, item.plan_id,
+                    item.merge_group, item.record.record_id),
+                investigation_id=batch.investigation_id,
+                plan_id=item.plan_id,
+                config_version=item.config_version,
+                merge_group=item.merge_group,
+                record=item.record,
+            )
+            _, created = self.store_investigation_sample(sample)
+            stored += int(created)
+        # 未配置类型仍保持原来的缺省行为：原样写入事件库存
+        for record in batch.unconfigured():
+            self._event_store.setdefault(record.source_host, []).append(record)
+            stored += 1
+        return stored
+
+    def store_investigation_sample(self, sample: InvestigationSample) -> tuple[InvestigationSample, bool]:
+        """调查样本幂等入库：同一代表（同调查+计划+组+记录）只收一次。
+
+        收下即派发调查员；并发确认时重复代表直接返回已收样本。
+        """
+        with self._sample_lock:
+            existing_id = self._sample_identity.get(sample.identity)
+            if existing_id is not None:
+                return self._investigation_samples[existing_id], False
+            self._investigation_samples[sample.sample_id] = sample
+            self._sample_identity[sample.identity] = sample.sample_id
+            sample.state = "已派发"
+            sample.delivered_to = "调查员"
+            return sample, True
+
+    def investigation_samples(self, plan_id: str | None = None,
+                              investigation_id: str | None = None) -> list[InvestigationSample]:
+        """查询库存里的调查样本，可按计划/调查过滤。"""
+        samples = list(self._investigation_samples.values())
+        if plan_id is not None:
+            samples = [s for s in samples if s.plan_id == plan_id]
+        if investigation_id is not None:
+            samples = [s for s in samples if s.investigation_id == investigation_id]
+        return samples
+
+    def find_investigation_sample(self, sample_id: str) -> InvestigationSample | None:
+        """按样本编号查找调查样本。"""
+        return self._investigation_samples.get(sample_id)
 
     # ---------- 数据流 2: ingest_job → batch_checkpoint（断点恢复） ----------
 
@@ -269,21 +335,16 @@ class IngestPipeline:
                       merge_key: str = "") -> list[EventRecord]:
         """采样归并——对应 sample_job 模块。
 
-        按 sample_ratio 采样，按 merge_key 归并（同 key 仅保留最新）。
+        先按 merge_key 归并（同键仅保留实际最新代表），再按归并后的
+        独立组数 × sample_ratio 计算名额取入选组代表；名额可为 0。
+        明确零额度与非法比例均不产出样本。
         """
-        sampled: list[EventRecord] = []
-        merged: dict[str, EventRecord] = {}
-        threshold = int(len(records) * sample_ratio)
-        for i, record in enumerate(records):
-            if merge_key:
-                mkey = record.parsed_fields.get(merge_key, "")
-                if mkey:
-                    merged[mkey] = record
-            if i < threshold:
-                sampled.append(record)
-        if merge_key:
-            return list(merged.values())
-        return sampled
+        if classify_sample_ratio(sample_ratio) is not None:
+            return []
+        groups = merge_event_groups(records, merge_key)
+        ordered = ordered_group_representatives(groups)
+        quota = int(len(ordered) * float(sample_ratio))
+        return [rep for _, rep in ordered[:quota]]
 
     # ---------- 数据流 6: archive_policy → event_store ----------
 

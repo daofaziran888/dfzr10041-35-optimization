@@ -260,13 +260,19 @@ class DedupFilter:
 
 @dataclass
 class SampleConfig:
-    """采样归并配置——对应 sample_job 模块。"""
+    """采样归并配置——对应 sample_job 模块。
+
+    version/state 支撑负责人改配的版本冲突处理：
+    每次改配生成新版本（待确认），结算轮次按采用的版本判定。
+    """
     plan_id: str
     event_type_id: str
     sample_ratio: float
     merge_key: str = ""
     merge_window_minutes: int = 5
     retain_policy: str = "latest"
+    version: int = 1
+    state: str = "已生效"
 
 
 @dataclass
